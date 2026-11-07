@@ -24,3 +24,6 @@ results/
 
 # Editor settings
 .vscode/
+
+# Local data audit
+reports/na_marker_audit.csv
