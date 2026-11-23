@@ -1,4 +1,6 @@
 
+import math
+
 import pandas as pd
 
 
@@ -21,38 +23,34 @@ def evaluate_ranked_retrieval(
         One of R1, R2 or R3.
 
     k_values:
-        Retrieval cutoffs at which to calculate precision and recall.
-
-    Returns:
-        DataFrame containing metrics for each cue.
+        Retrieval cutoffs for evaluation.
     """
 
     if response_col not in test_data.columns:
         raise ValueError(f"Column {response_col} not found.")
 
-    if any(k <= 0 for k in k_values):
-        raise ValueError("All K values must be positive.")
+    if not k_values or any(k <= 0 for k in k_values):
+        raise ValueError("K values must be positive.")
 
-    # Ignore unavailable responses.
+    # Exclude unavailable responses.
     valid_data = test_data[
         test_data[response_col] != ""
     ]
 
     results = []
 
-    # Evaluate each cue independently.
+    # Evaluate every cue separately.
     for cue, group in valid_data.groupby("cue"):
 
-        # Count how many times each response occurred.
+        # Human response frequencies in the test set.
         target_counts = group[response_col].value_counts()
 
-        # Distinct responses considered relevant.
         relevant = set(target_counts.index)
 
-        # Retrieve the model's complete ranking.
+        # Model's ranked candidate list.
         ranked = list(ranked_by_cue.get(cue, []))
 
-        # Ensure candidates are unique while preserving rank.
+        # Remove duplicate predictions while preserving order.
         ranked = list(dict.fromkeys(ranked))
 
         candidate_set = set(ranked)
@@ -67,7 +65,10 @@ def evaluate_ranked_retrieval(
             "n_candidates": len(ranked)
         }
 
-        # Calculate candidate coverage.
+        # --------------------------------------------------
+        # 1. Candidate coverage
+        # --------------------------------------------------
+
         available = relevant.intersection(candidate_set)
 
         row["candidate_coverage"] = (
@@ -83,7 +84,32 @@ def evaluate_ranked_retrieval(
             covered_frequency / total_responses
         )
 
-        # Calculate MRR over the complete ranking.
+        # --------------------------------------------------
+        # 2. Top-1 modal-response agreement
+        # --------------------------------------------------
+
+        maximum_frequency = target_counts.max()
+
+        # There can be multiple equally frequent responses.
+        modal_responses = set(
+            target_counts[
+                target_counts == maximum_frequency
+            ].index
+        )
+
+        row["n_modal_responses"] = len(modal_responses)
+        row["modal_tie"] = len(modal_responses) > 1
+
+        top_prediction = ranked[0] if ranked else None
+
+        row["top1_modal_agreement"] = float(
+            top_prediction in modal_responses
+        )
+
+        # --------------------------------------------------
+        # 3. Mean Reciprocal Rank
+        # --------------------------------------------------
+
         first_relevant_rank = next(
             (
                 rank
@@ -99,7 +125,10 @@ def evaluate_ranked_retrieval(
             else 0.0
         )
 
-        # Calculate metrics at each K.
+        # --------------------------------------------------
+        # 4. Precision, recall and NDCG at different K
+        # --------------------------------------------------
+
         for k in k_values:
 
             top_k = ranked[:k]
@@ -107,9 +136,13 @@ def evaluate_ranked_retrieval(
 
             hits = relevant.intersection(retrieved)
 
+            # Precision@K
             precision = len(hits) / k
+
+            # Recall@K
             recall = len(hits) / total_unique
 
+            # Frequency-weighted Recall@K
             retrieved_frequency = sum(
                 int(target_counts.get(response, 0))
                 for response in retrieved
@@ -123,6 +156,31 @@ def evaluate_ranked_retrieval(
             row[f"recall_at_{k}"] = recall
             row[f"weighted_recall_at_{k}"] = weighted_recall
 
+            # NDCG@K using human response frequencies
+            dcg = sum(
+                int(target_counts.get(response, 0))
+                / math.log2(rank + 1)
+                for rank, response in enumerate(top_k, start=1)
+            )
+
+            # Ideal ranking: most frequent human responses first.
+            ideal_frequencies = sorted(
+                target_counts.tolist(),
+                reverse=True
+            )[:k]
+
+            idcg = sum(
+                frequency / math.log2(rank + 1)
+                for rank, frequency in enumerate(
+                    ideal_frequencies,
+                    start=1
+                )
+            )
+
+            ndcg = dcg / idcg if idcg > 0 else 0.0
+
+            row[f"ndcg_at_{k}"] = ndcg
+
         results.append(row)
 
     return pd.DataFrame(results)
@@ -130,27 +188,33 @@ def evaluate_ranked_retrieval(
 
 def summarise_evaluation(per_cue_results):
     """
-    Calculate macro-averaged evaluation metrics
-    across cues for each response position.
+    Calculate macro-averaged evaluation metrics across cues.
+
+    Also reports the proportion of cues whose most frequent
+    test response has a tie.
     """
+
+    metric_prefixes = (
+        "precision_at_",
+        "recall_at_",
+        "weighted_recall_at_",
+        "ndcg_at_"
+    )
 
     metric_columns = [
         column
         for column in per_cue_results.columns
-        if (
-            column.startswith("precision_at_")
-            or column.startswith("recall_at_")
-            or column.startswith("weighted_recall_at_")
-        )
+        if column.startswith(metric_prefixes)
     ]
 
     metric_columns += [
+        "top1_modal_agreement",
         "mrr",
         "candidate_coverage",
         "weighted_candidate_coverage"
     ]
 
-    # Average each metric equally across cues.
+    # Each cue receives equal weight in the macro average.
     means = (
         per_cue_results
         .groupby("response_position")[metric_columns]
@@ -158,13 +222,15 @@ def summarise_evaluation(per_cue_results):
         .reset_index()
     )
 
-    # Report the amount of test data supporting each result.
+    # Report evaluation support and frequency ties.
     support = (
         per_cue_results
         .groupby("response_position")
         .agg(
             n_cues=("cue", "nunique"),
-            valid_test_responses=("n_test_responses", "sum")
+            valid_test_responses=("n_test_responses", "sum"),
+            tied_modal_cues=("modal_tie", "sum"),
+            modal_tie_rate=("modal_tie", "mean")
         )
         .reset_index()
     )
@@ -174,6 +240,7 @@ def summarise_evaluation(per_cue_results):
         on="response_position"
     )
 
+    # Preserve R1, R2, R3 ordering.
     order = ["R1", "R2", "R3"]
 
     summary["response_position"] = pd.Categorical(
@@ -183,3 +250,4 @@ def summarise_evaluation(per_cue_results):
     )
 
     return summary.sort_values("response_position")
+
